@@ -12,6 +12,7 @@ class LibraryActivity final : public Activity {
   struct LibraryEntry {
     std::string path;
     std::string title;
+    std::string author;
   };
 
   struct MagazineSeriesEntry {
