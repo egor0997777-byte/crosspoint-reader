@@ -13,6 +13,8 @@ class LibraryActivity final : public Activity {
     std::string path;
     std::string title;
     std::string author;
+    std::string thumbPath;
+    bool coverAttempted = false;
   };
 
   struct MagazineSeriesEntry {
@@ -37,7 +39,13 @@ class LibraryActivity final : public Activity {
   void loadMagazineSeries();
   void loadIssuesForSeries(const std::string& series);
   bool isMagazinePath(const std::string& path) const;
+  size_t regularBookCount() const;
+  LibraryEntry* regularBookAt(size_t index);
+  const LibraryEntry* regularBookAt(size_t index) const;
+  int rootPrefixCount() const;
   int currentItemCount() const;
+  bool ensureThumb(LibraryEntry& book, int coverHeight);
+  void drawBookCard(LibraryEntry& book, int x, int y, int width, int height, bool selected);
   void openSelected();
   void goBack();
 
