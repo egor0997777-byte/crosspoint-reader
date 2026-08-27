@@ -38,21 +38,32 @@ bool MagazineIssueStore::fromJson(JsonVariantConst doc) {
 
 bool MagazineIssueStore::recordIssue(const std::string& series, const std::string& path, const std::string& title,
                                      const std::string& author) {
-  if (series.empty() || path.empty()) return false;
+  return recordIssues({MagazineIssue{series, path, title, author}});
+}
 
-  auto it = std::find_if(issues.begin(), issues.end(), [&path](const MagazineIssue& issue) { return issue.path == path; });
-  if (it != issues.end()) {
-    it->series = series;
-    it->title = title;
-    it->author = author;
-    MagazineIssue updated = std::move(*it);
-    issues.erase(it);
-    issues.insert(issues.begin(), std::move(updated));
-  } else {
-    issues.insert(issues.begin(), MagazineIssue{series, path, title, author});
-    if (issues.size() > MAX_ISSUES) issues.resize(MAX_ISSUES);
+bool MagazineIssueStore::recordIssues(const std::vector<MagazineIssue>& feedOrder) {
+  if (feedOrder.empty()) return true;
+
+  std::vector<MagazineIssue> incoming;
+  incoming.reserve(feedOrder.size());
+  for (const auto& issue : feedOrder) {
+    if (issue.series.empty() || issue.path.empty()) continue;
+    const bool duplicate = std::any_of(incoming.begin(), incoming.end(), [&issue](const MagazineIssue& existing) {
+      return existing.path == issue.path;
+    });
+    if (!duplicate) incoming.push_back(issue);
   }
+  if (incoming.empty()) return false;
 
+  issues.erase(std::remove_if(issues.begin(), issues.end(), [&incoming](const MagazineIssue& existing) {
+                 return std::any_of(incoming.begin(), incoming.end(), [&existing](const MagazineIssue& fresh) {
+                   return fresh.path == existing.path;
+                 });
+               }),
+               issues.end());
+
+  issues.insert(issues.begin(), incoming.begin(), incoming.end());
+  if (issues.size() > MAX_ISSUES) issues.resize(MAX_ISSUES);
   return saveToFile();
 }
 
