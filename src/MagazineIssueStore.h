@@ -29,6 +29,10 @@ class MagazineIssueStore : public PersistableStore<MagazineIssueStore> {
 
   bool recordIssue(const std::string& series, const std::string& path, const std::string& title,
                    const std::string& author);
+  // Record one OPDS feed batch while preserving its order. Items in feedOrder
+  // become the newest block at the front; existing copies of those paths are
+  // removed first. This keeps a newest-first OPDS feed newest-first in Library.
+  bool recordIssues(const std::vector<MagazineIssue>& feedOrder);
   bool pruneMissing();
 
   const std::vector<MagazineIssue>& getIssues() const { return issues; }
