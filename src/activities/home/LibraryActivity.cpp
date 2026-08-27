@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "MappedInputManager.h"
+#include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -70,22 +71,140 @@ void LibraryActivity::scanDirectory(const std::string& path) {
   dir.close();
 }
 
+void LibraryActivity::loadMagazineSeries() {
+  magazineSeries.clear();
+
+  for (const auto& issue : MAGAZINE_ISSUES.getIssues()) {
+    auto it = std::find_if(magazineSeries.begin(), magazineSeries.end(), [&issue](const MagazineSeriesEntry& entry) {
+      return entry.name == issue.series;
+    });
+    if (it == magazineSeries.end()) {
+      MagazineSeriesEntry series;
+      series.name = issue.series;
+      series.issueCount = 1;
+      series.latestTitle = issue.title.empty() ? fileTitleFromPath(issue.path) : issue.title;
+      magazineSeries.push_back(std::move(series));
+    } else {
+      ++it->issueCount;
+    }
+  }
+
+  std::sort(magazineSeries.begin(), magazineSeries.end(), [](const MagazineSeriesEntry& a, const MagazineSeriesEntry& b) {
+    return a.name < b.name;
+  });
+}
+
+void LibraryActivity::loadIssuesForSeries(const std::string& series) {
+  visibleIssues.clear();
+  for (const auto& issue : MAGAZINE_ISSUES.getIssues()) {
+    if (issue.series == series && Storage.exists(issue.path.c_str())) visibleIssues.push_back(issue);
+  }
+}
+
+bool LibraryActivity::isMagazinePath(const std::string& path) const {
+  const auto& issues = MAGAZINE_ISSUES.getIssues();
+  return std::any_of(issues.begin(), issues.end(), [&path](const MagazineIssue& issue) { return issue.path == path; });
+}
+
+int LibraryActivity::currentItemCount() const {
+  if (view == View::Magazines) return static_cast<int>(magazineSeries.size());
+  if (view == View::Issues) return static_cast<int>(visibleIssues.size());
+
+  int count = 0;
+  const auto& recent = RECENT_BOOKS.getBooks();
+  if (!recent.empty() && !RecentBooksStore::isMissing(recent.front())) ++count;
+  if (!magazineSeries.empty()) ++count;
+  for (const auto& book : books) {
+    if (!isMagazinePath(book.path)) ++count;
+  }
+  return count;
+}
+
 void LibraryActivity::onEnter() {
   Activity::onEnter();
   selectorIndex = 0;
+  view = View::Root;
+  selectedSeries.clear();
   lockNextConfirmRelease = mappedInput.isPressed(MappedInputManager::Button::Confirm);
+
+  if (RECENT_BOOKS.pruneMissing()) RECENT_BOOKS.saveToFile();
+  MAGAZINE_ISSUES.loadFromFile();
+  if (MAGAZINE_ISSUES.pruneMissing()) MAGAZINE_ISSUES.saveToFile();
+
   scanLibrary();
+  loadMagazineSeries();
   requestUpdate();
 }
 
 void LibraryActivity::onExit() {
   Activity::onExit();
   books.clear();
+  magazineSeries.clear();
+  visibleIssues.clear();
 }
 
 void LibraryActivity::openSelected() {
-  if (books.empty() || selectorIndex >= books.size()) return;
-  activityManager.goToReader(books[selectorIndex].path);
+  if (view == View::Magazines) {
+    if (selectorIndex >= magazineSeries.size()) return;
+    selectedSeries = magazineSeries[selectorIndex].name;
+    loadIssuesForSeries(selectedSeries);
+    selectorIndex = 0;
+    view = View::Issues;
+    requestUpdate();
+    return;
+  }
+
+  if (view == View::Issues) {
+    if (selectorIndex >= visibleIssues.size()) return;
+    activityManager.goToReader(visibleIssues[selectorIndex].path);
+    return;
+  }
+
+  size_t index = selectorIndex;
+  const auto& recent = RECENT_BOOKS.getBooks();
+  const bool hasContinue = !recent.empty() && !RecentBooksStore::isMissing(recent.front());
+  if (hasContinue) {
+    if (index == 0) {
+      activityManager.goToReader(recent.front().path);
+      return;
+    }
+    --index;
+  }
+
+  if (!magazineSeries.empty()) {
+    if (index == 0) {
+      selectorIndex = 0;
+      view = View::Magazines;
+      requestUpdate();
+      return;
+    }
+    --index;
+  }
+
+  for (const auto& book : books) {
+    if (isMagazinePath(book.path)) continue;
+    if (index == 0) {
+      activityManager.goToReader(book.path);
+      return;
+    }
+    --index;
+  }
+}
+
+void LibraryActivity::goBack() {
+  if (view == View::Issues) {
+    view = View::Magazines;
+    selectorIndex = 0;
+    visibleIssues.clear();
+    requestUpdate();
+  } else if (view == View::Magazines) {
+    view = View::Root;
+    selectorIndex = 0;
+    selectedSeries.clear();
+    requestUpdate();
+  } else {
+    onGoHome();
+  }
 }
 
 void LibraryActivity::loop() {
@@ -93,6 +212,7 @@ void LibraryActivity::loop() {
   const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
   const int contentHeight = renderer.getScreenHeight() - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing;
   const int pageItems = UITheme::getInstance().getNumberOfItemsPerPage(renderer, true, false, true, true);
+  const int listSize = currentItemCount();
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     if (lockNextConfirmRelease) {
@@ -104,7 +224,7 @@ void LibraryActivity::loop() {
   }
 
   int touchSel = static_cast<int>(selectorIndex);
-  const auto listTouch = handleListTouch(touchSel, static_cast<int>(books.size()), contentTop, contentHeight, true);
+  const auto listTouch = handleListTouch(touchSel, listSize, contentTop, contentHeight, true);
   if (listTouch != ListTouchResult::None) {
     selectorIndex = static_cast<size_t>(touchSel);
     if (listTouch == ListTouchResult::Activated) openSelected();
@@ -112,11 +232,12 @@ void LibraryActivity::loop() {
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-    onGoHome();
+    goBack();
     return;
   }
 
-  const int listSize = static_cast<int>(books.size());
+  if (listSize <= 0) return;
+
   const auto swipe = mappedInput.wasSwipe();
   if (swipe == MappedInputManager::SwipeDir::Up) {
     selectorIndex = ButtonNavigator::nextPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
@@ -154,21 +275,104 @@ void LibraryActivity::render(RenderLock&&) {
   const auto pageHeight = renderer.getScreenHeight();
   const auto& metrics = UITheme::getInstance().getMetrics();
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, "Library");
+  const char* heading = "Library";
+  if (view == View::Magazines) heading = "Magazines";
+  if (view == View::Issues) heading = selectedSeries.c_str();
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, heading);
 
   const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
   const int contentHeight = pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing;
 
-  if (books.empty()) {
-    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, "No EPUB books found");
+  if (view == View::Magazines) {
+    if (magazineSeries.empty()) {
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, "No magazine issues yet");
+    } else {
+      GUI.drawList(renderer, Rect{0, contentTop, pageWidth, contentHeight}, magazineSeries.size(), selectorIndex,
+                   [this](int index) { return magazineSeries[index].name; },
+                   [this](int index) {
+                     return std::to_string(magazineSeries[index].issueCount) + " issues - latest: " +
+                            magazineSeries[index].latestTitle;
+                   },
+                   [this](int) { return UITheme::getFileIcon("magazine.epub"); });
+    }
+  } else if (view == View::Issues) {
+    if (visibleIssues.empty()) {
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, "No issues found");
+    } else {
+      GUI.drawList(renderer, Rect{0, contentTop, pageWidth, contentHeight}, visibleIssues.size(), selectorIndex,
+                   [this](int index) {
+                     return visibleIssues[index].title.empty() ? fileTitleFromPath(visibleIssues[index].path)
+                                                               : visibleIssues[index].title;
+                   },
+                   [this](int index) { return visibleIssues[index].author; },
+                   [this](int) { return UITheme::getFileIcon("magazine.epub"); });
+    }
   } else {
-    GUI.drawList(renderer, Rect{0, contentTop, pageWidth, contentHeight}, books.size(), selectorIndex,
-                 [this](int index) { return books[index].title; },
-                 [this](int index) { return books[index].path; },
-                 [this](int) { return UITheme::getFileIcon("book.epub"); });
+    const auto& recent = RECENT_BOOKS.getBooks();
+    const bool hasContinue = !recent.empty() && !RecentBooksStore::isMissing(recent.front());
+    const int itemCount = currentItemCount();
+
+    if (itemCount == 0) {
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, "No EPUB books found");
+    } else {
+      GUI.drawList(
+          renderer, Rect{0, contentTop, pageWidth, contentHeight}, itemCount, selectorIndex,
+          [this, hasContinue, &recent](int rawIndex) {
+            size_t index = static_cast<size_t>(rawIndex);
+            if (hasContinue) {
+              if (index == 0) return recent.front().title.empty() ? fileTitleFromPath(recent.front().path)
+                                                                  : recent.front().title;
+              --index;
+            }
+            if (!magazineSeries.empty()) {
+              if (index == 0) return std::string("Magazines");
+              --index;
+            }
+            for (const auto& book : books) {
+              if (isMagazinePath(book.path)) continue;
+              if (index == 0) return book.title;
+              --index;
+            }
+            return std::string();
+          },
+          [this, hasContinue, &recent](int rawIndex) {
+            size_t index = static_cast<size_t>(rawIndex);
+            if (hasContinue) {
+              if (index == 0) {
+                const std::string author = recent.front().author;
+                return author.empty() ? std::string("Continue reading") : std::string("Continue reading - ") + author;
+              }
+              --index;
+            }
+            if (!magazineSeries.empty()) {
+              if (index == 0) {
+                size_t issueCount = 0;
+                for (const auto& series : magazineSeries) issueCount += series.issueCount;
+                return std::to_string(magazineSeries.size()) + " titles - " + std::to_string(issueCount) + " issues";
+              }
+              --index;
+            }
+            for (const auto& book : books) {
+              if (isMagazinePath(book.path)) continue;
+              if (index == 0) return book.path;
+              --index;
+            }
+            return std::string();
+          },
+          [this, hasContinue](int rawIndex) {
+            size_t index = static_cast<size_t>(rawIndex);
+            if (hasContinue) {
+              if (index == 0) return UITheme::getFileIcon("book.epub");
+              --index;
+            }
+            if (!magazineSeries.empty() && index == 0) return UITheme::getFileIcon("magazine.epub");
+            return UITheme::getFileIcon("book.epub");
+          });
+    }
   }
 
-  const auto labels = mappedInput.mapLabels(tr(STR_HOME), tr(STR_OPEN), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+  const auto labels = mappedInput.mapLabels(view == View::Root ? tr(STR_HOME) : tr(STR_BACK), tr(STR_OPEN),
+                                            tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
 }
