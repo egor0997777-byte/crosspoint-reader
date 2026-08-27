@@ -30,21 +30,6 @@ std::string fileTitleFromPath(const std::string& path) {
 bool shouldSkipDirectory(const char* name) {
   return name[0] == '.' || strcmp(name, "System Volume Information") == 0;
 }
-
-LibraryActivity::LibraryEntry buildLibraryEntry(const std::string& path) {
-  LibraryActivity::LibraryEntry result{path, fileTitleFromPath(path), ""};
-
-  // Reuse CrossPoint's existing EPUB metadata cache. The first scan may need
-  // to build cache data; later Library opens should reuse it instead of parsing
-  // the EPUB package from scratch.
-  Epub epub(path, "/.crosspoint");
-  if (epub.load(true, true)) {
-    if (!epub.getTitle().empty()) result.title = epub.getTitle();
-    result.author = epub.getAuthor();
-  }
-
-  return result;
-}
 }  // namespace
 
 void LibraryActivity::scanLibrary() {
@@ -80,7 +65,16 @@ void LibraryActivity::scanDirectory(const std::string& path) {
     if (isDir) {
       scanDirectory(fullPath);
     } else if (FsHelpers::hasEpubExtension(fullPath)) {
-      books.push_back(buildLibraryEntry(fullPath));
+      LibraryEntry book{fullPath, fileTitleFromPath(fullPath), ""};
+
+      // Reuse CrossPoint's existing EPUB metadata cache. The first scan may
+      // build it; later opens reuse it instead of parsing the package again.
+      Epub epub(fullPath, "/.crosspoint");
+      if (epub.load(true, true)) {
+        if (!epub.getTitle().empty()) book.title = epub.getTitle();
+        book.author = epub.getAuthor();
+      }
+      books.push_back(std::move(book));
     }
   }
 
