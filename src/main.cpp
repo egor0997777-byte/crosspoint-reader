@@ -32,6 +32,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "images/LoadingIcon.h"
+#include "network/AutoOpdsSync.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -136,6 +137,14 @@ enum class BootResume : uint8_t {
 // startDeepSleep() does not return, so a set latch only ends at the wakeup reset.
 static bool deepSleepInProgress = false;
 
+// Keep the existing deep-sleep path and power-button wake intact. The timer is
+// an additional X3-only wake source; PowerManager arms the button source after
+// this function returns to it, so both sources remain active for the sleep.
+void startDeepSleepWithSchedule() {
+  if (gpio.deviceIsX3()) AutoOpdsSync::armNextWake();
+  powerManager.startDeepSleep(gpio);
+}
+
 void silentRestart() {
   if (deepSleepInProgress) return;  // sleeping supersedes the heap-defrag reboot
   silentRebootTarget = SILENT_REBOOT_TARGET_HOME;
@@ -224,7 +233,7 @@ void enterDeepSleep(bool fromTimeout = false) {
   display.deepSleep();
   LOG_DBG("MAIN", "Entering deep sleep");
 
-  powerManager.startDeepSleep(gpio);
+  startDeepSleepWithSchedule();
 }
 
 void setupDisplayAndFonts(bool seamless = false) {
@@ -294,10 +303,16 @@ void setup() {
   halClock.begin();
 
   LOG_INF("MAIN", "Hardware detect: %s", gpio.deviceIsX3() ? "X3" : "X4");
+  const bool scheduledOpdsWake = AutoOpdsSync::isTimerWake();
 
   // SD Card Initialization
   // We need 6 open files concurrently when parsing a new chapter
   if (!Storage.begin()) {
+    if (scheduledOpdsWake) {
+      LOG_ERR("MAIN", "Scheduled OPDS wake aborted: SD card initialization failed");
+      powerManager.startDeepSleep(gpio);
+      return;
+    }
     LOG_ERR("MAIN", "SD card initialization failed");
     setupDisplayAndFonts(isSilentReboot);
     activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
@@ -306,14 +321,29 @@ void setup() {
 
   HalSystem::checkPanic();
 
-  SETTINGS.loadFromFile();
+  const bool settingsLoaded = SETTINGS.loadFromFile();
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
   KOREADER_STORE.loadFromFile();
-  OPDS_STORE.loadFromFile();
+  const bool opdsStoreLoaded = OPDS_STORE.loadFromFile();
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
+
+  if (scheduledOpdsWake) {
+    if (!settingsLoaded || !opdsStoreLoaded) {
+      if (!settingsLoaded) LOG_ERR("MAIN", "Scheduled OPDS wake aborted: CrossPoint settings could not be loaded");
+      if (!opdsStoreLoaded) LOG_ERR("MAIN", "Scheduled OPDS wake aborted: OPDS store could not be loaded");
+      halTiltSensor.deepSleep();
+      startDeepSleepWithSchedule();
+      return;
+    }
+    LOG_INF("MAIN", "Wakeup reason: scheduled OPDS timer");
+    AutoOpdsSync::run();
+    halTiltSensor.deepSleep();
+    startDeepSleepWithSchedule();
+    return;
+  }
 
   const auto wakeupReason = gpio.getWakeupReason();
   switch (wakeupReason) {
@@ -321,13 +351,13 @@ void setup() {
       LOG_DBG("MAIN", "Verifying power button press duration");
       if (!gpio.verifyPowerButtonWakeup(SETTINGS.getPowerButtonDuration(),
                                         SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP)) {
-        powerManager.startDeepSleep(gpio);
+        startDeepSleepWithSchedule();
       }
       break;
     case HalGPIO::WakeupReason::AfterUSBPower:
       // If USB power caused a cold boot, go back to sleep
       LOG_DBG("MAIN", "Wakeup reason: After USB Power");
-      powerManager.startDeepSleep(gpio);
+      startDeepSleepWithSchedule();
       break;
     case HalGPIO::WakeupReason::AfterFlash:
       // After flashing, just proceed to boot
