@@ -18,6 +18,7 @@
 #include <utility>
 
 #include "CrossPointSettings.h"
+#include "MagazineIssueStore.h"
 #include "OpdsServerStore.h"
 #include "WifiCredentialStore.h"
 #include "network/AutoOpdsSyncSchedule.h"
@@ -87,12 +88,20 @@ void diagnostic(const char* format, ...) {
 
 bool isAutoServer(const OpdsServer& server) { return isAutoServerName(server.name); }
 
+std::string magazineSeriesName(const OpdsServer& server) {
+  std::string name = server.name;
+  if (name.rfind("AUTO:", 0) == 0) name.erase(0, 5);
+
+  const auto first = name.find_first_not_of(" \t");
+  if (first == std::string::npos) return server.name;
+  const auto last = name.find_last_not_of(" \t");
+  return name.substr(first, last - first + 1);
+}
+
 bool tryCredential(const WifiCredential& credential, const unsigned long timeoutMs) {
   LOG_INF("AODS", "Trying saved WiFi: %s", credential.ssid.c_str());
   diagnostic("wifi try ssid=%s timeout_ms=%lu", credential.ssid.c_str(), timeoutMs);
 
-  // Credentials are owned by WifiCredentialStore. Keep Arduino's own NVS
-  // auto-connect disabled, matching WifiSelectionActivity's manual flow.
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
@@ -186,6 +195,18 @@ std::string destinationPath(const OpdsEntry& book) {
   return path;
 }
 
+bool recordMagazineIssue(const OpdsServer& server, const OpdsEntry& entry, const std::string& destination) {
+  const std::string series = magazineSeriesName(server);
+  if (MAGAZINE_ISSUES.recordIssue(series, destination, entry.title, entry.author)) {
+    diagnostic("magazine indexed series=%s title=%s path=%s", series.c_str(), entry.title.c_str(), destination.c_str());
+    return true;
+  }
+  LOG_ERR("AODS", "Failed to update magazine index: %s", destination.c_str());
+  diagnostic("magazine index failed series=%s title=%s path=%s", series.c_str(), entry.title.c_str(),
+             destination.c_str());
+  return false;
+}
+
 bool syncServer(const OpdsServer& server) {
   if (server.url.empty()) {
     LOG_ERR("AODS", "AUTO server has no URL: %s", server.name.c_str());
@@ -218,9 +239,6 @@ bool syncServer(const OpdsServer& server) {
     diagnostic("server feed truncated name=%s", server.name.c_str());
   }
 
-  // Moving the bounded parser vector keeps the existing parser allocation and
-  // avoids a second copy. Only this root feed is inspected; navigation entries
-  // are deliberately ignored and never fetched recursively.
   auto entries = std::move(parser).getEntries();
   size_t downloaded = 0;
   size_t bookEntries = 0;
@@ -240,6 +258,7 @@ bool syncServer(const OpdsServer& server) {
       ++existingEntries;
       LOG_DBG("AODS", "Already present: %s", destination.c_str());
       diagnostic("skip existing title=%s path=%s", entry.title.c_str(), destination.c_str());
+      if (!recordMagazineIssue(server, entry, destination)) serverOk = false;
       continue;
     }
 
@@ -255,10 +274,8 @@ bool syncServer(const OpdsServer& server) {
       continue;
     }
 
-    // The downloader rejects empty responses and removes failed partial files.
-    // The existence check above ensures an unattended run never intentionally
-    // replaces a pre-existing EPUB.
     clearBookCache(destination);
+    if (!recordMagazineIssue(server, entry, destination)) serverOk = false;
     ++downloaded;
     LOG_INF("AODS", "Downloaded EPUB: %s", destination.c_str());
     diagnostic("download ok title=%s path=%s", entry.title.c_str(), destination.c_str());
@@ -354,8 +371,6 @@ bool run() {
     return false;
   }
 
-  // NTP is best-effort here. A successful sync corrects the RTC before the
-  // next timer is armed; a failed sync leaves the last valid RTC value in use.
   if (halClock.isAvailable()) {
     const bool ntpOk = halClock.syncFromNTP();
     diagnostic("ntp result=%s", ntpOk ? "ok" : "failed");
@@ -371,6 +386,11 @@ bool run() {
       LOG_ERR("AODS", "NTP sync failed; continuing with current RTC time");
     }
   }
+
+  // Load the persistent magazine index before touching AUTO feeds. A missing
+  // file simply means this is the first run; recordIssue() will create it.
+  MAGAZINE_ISSUES.loadFromFile();
+  if (MAGAZINE_ISSUES.pruneMissing()) MAGAZINE_ISSUES.saveToFile();
 
   bool ok = true;
   for (const auto& server : OPDS_STORE.getServers()) {
