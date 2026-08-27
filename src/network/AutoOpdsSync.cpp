@@ -14,8 +14,10 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "CrossPointSettings.h"
 #include "MagazineIssueStore.h"
@@ -195,15 +197,15 @@ std::string destinationPath(const OpdsEntry& book) {
   return path;
 }
 
-bool recordMagazineIssue(const OpdsServer& server, const OpdsEntry& entry, const std::string& destination) {
-  const std::string series = magazineSeriesName(server);
-  if (MAGAZINE_ISSUES.recordIssue(series, destination, entry.title, entry.author)) {
-    diagnostic("magazine indexed series=%s title=%s path=%s", series.c_str(), entry.title.c_str(), destination.c_str());
+bool indexMagazineBatch(const std::vector<MagazineIssue>& issues) {
+  if (issues.empty()) return true;
+  if (MAGAZINE_ISSUES.recordIssues(issues)) {
+    diagnostic("magazine batch indexed count=%u series=%s", static_cast<unsigned>(issues.size()),
+               issues.front().series.c_str());
     return true;
   }
-  LOG_ERR("AODS", "Failed to update magazine index: %s", destination.c_str());
-  diagnostic("magazine index failed series=%s title=%s path=%s", series.c_str(), entry.title.c_str(),
-             destination.c_str());
+  LOG_ERR("AODS", "Failed to update magazine index batch");
+  diagnostic("magazine batch index failed count=%u", static_cast<unsigned>(issues.size()));
   return false;
 }
 
@@ -245,6 +247,9 @@ bool syncServer(const OpdsServer& server) {
   size_t navigationEntries = 0;
   size_t existingEntries = 0;
   bool serverOk = true;
+  const std::string series = magazineSeriesName(server);
+  std::vector<MagazineIssue> feedIssues;
+  feedIssues.reserve(entries.size());
 
   for (const auto& entry : entries) {
     if (entry.type != OpdsEntryType::BOOK) {
@@ -258,7 +263,7 @@ bool syncServer(const OpdsServer& server) {
       ++existingEntries;
       LOG_DBG("AODS", "Already present: %s", destination.c_str());
       diagnostic("skip existing title=%s path=%s", entry.title.c_str(), destination.c_str());
-      if (!recordMagazineIssue(server, entry, destination)) serverOk = false;
+      feedIssues.push_back(MagazineIssue{series, destination, entry.title, entry.author});
       continue;
     }
 
@@ -275,18 +280,21 @@ bool syncServer(const OpdsServer& server) {
     }
 
     clearBookCache(destination);
-    if (!recordMagazineIssue(server, entry, destination)) serverOk = false;
+    feedIssues.push_back(MagazineIssue{series, destination, entry.title, entry.author});
     ++downloaded;
     LOG_INF("AODS", "Downloaded EPUB: %s", destination.c_str());
     diagnostic("download ok title=%s path=%s", entry.title.c_str(), destination.c_str());
     if (downloaded >= MAX_DOWNLOADS_PER_SERVER) break;
   }
 
+  if (!indexMagazineBatch(feedIssues)) serverOk = false;
+
   if (bookEntries == 0) LOG_INF("AODS", "No EPUB entries in root feed: %s", server.name.c_str());
   LOG_INF("AODS", "Server done: %s, new=%u", server.name.c_str(), static_cast<unsigned>(downloaded));
-  diagnostic("server done name=%s books=%u navigation=%u existing=%u downloaded=%u ok=%d", server.name.c_str(),
-             static_cast<unsigned>(bookEntries), static_cast<unsigned>(navigationEntries),
-             static_cast<unsigned>(existingEntries), static_cast<unsigned>(downloaded), serverOk ? 1 : 0);
+  diagnostic("server done name=%s books=%u navigation=%u existing=%u downloaded=%u indexed=%u ok=%d",
+             server.name.c_str(), static_cast<unsigned>(bookEntries), static_cast<unsigned>(navigationEntries),
+             static_cast<unsigned>(existingEntries), static_cast<unsigned>(downloaded),
+             static_cast<unsigned>(feedIssues.size()), serverOk ? 1 : 0);
   return serverOk;
 }
 
@@ -387,8 +395,6 @@ bool run() {
     }
   }
 
-  // Load the persistent magazine index before touching AUTO feeds. A missing
-  // file simply means this is the first run; recordIssue() will create it.
   MAGAZINE_ISSUES.loadFromFile();
   if (MAGAZINE_ISSUES.pruneMissing()) MAGAZINE_ISSUES.saveToFile();
 
