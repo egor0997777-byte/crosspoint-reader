@@ -1,5 +1,6 @@
 #include "LibraryActivity.h"
 
+#include <Bitmap.h>
 #include <Epub.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
@@ -18,6 +19,9 @@
 namespace {
 constexpr size_t NAME_BUFFER_SIZE = 500;
 constexpr size_t MAX_LIBRARY_BOOKS = 1000;
+constexpr int GRID_COLUMNS = 2;
+constexpr int GRID_ROWS = 2;
+constexpr int GRID_BOOKS_PER_PAGE = GRID_COLUMNS * GRID_ROWS;
 
 std::string fileTitleFromPath(const std::string& path) {
   const auto slash = path.find_last_of('/');
@@ -65,7 +69,9 @@ void LibraryActivity::scanDirectory(const std::string& path) {
     if (isDir) {
       scanDirectory(fullPath);
     } else if (FsHelpers::hasEpubExtension(fullPath)) {
-      LibraryEntry book{fullPath, fileTitleFromPath(fullPath), ""};
+      LibraryEntry book;
+      book.path = fullPath;
+      book.title = fileTitleFromPath(fullPath);
 
       // Reuse CrossPoint's existing EPUB metadata cache. The first scan may
       // build it; later opens reuse it instead of parsing the package again.
@@ -116,18 +122,110 @@ bool LibraryActivity::isMagazinePath(const std::string& path) const {
   return std::any_of(issues.begin(), issues.end(), [&path](const MagazineIssue& issue) { return issue.path == path; });
 }
 
-int LibraryActivity::currentItemCount() const {
-  if (view == View::Magazines) return static_cast<int>(magazineSeries.size());
-  if (view == View::Issues) return static_cast<int>(visibleIssues.size());
-
-  int count = 0;
-  const auto& recent = RECENT_BOOKS.getBooks();
-  if (!recent.empty() && !RecentBooksStore::isMissing(recent.front())) ++count;
-  if (!magazineSeries.empty()) ++count;
+size_t LibraryActivity::regularBookCount() const {
+  size_t count = 0;
   for (const auto& book : books) {
     if (!isMagazinePath(book.path)) ++count;
   }
   return count;
+}
+
+LibraryActivity::LibraryEntry* LibraryActivity::regularBookAt(size_t index) {
+  for (auto& book : books) {
+    if (isMagazinePath(book.path)) continue;
+    if (index == 0) return &book;
+    --index;
+  }
+  return nullptr;
+}
+
+const LibraryActivity::LibraryEntry* LibraryActivity::regularBookAt(size_t index) const {
+  for (const auto& book : books) {
+    if (isMagazinePath(book.path)) continue;
+    if (index == 0) return &book;
+    --index;
+  }
+  return nullptr;
+}
+
+int LibraryActivity::rootPrefixCount() const {
+  int count = 0;
+  const auto& recent = RECENT_BOOKS.getBooks();
+  if (!recent.empty() && !RecentBooksStore::isMissing(recent.front())) ++count;
+  if (!magazineSeries.empty()) ++count;
+  return count;
+}
+
+int LibraryActivity::currentItemCount() const {
+  if (view == View::Magazines) return static_cast<int>(magazineSeries.size());
+  if (view == View::Issues) return static_cast<int>(visibleIssues.size());
+  return rootPrefixCount() + static_cast<int>(regularBookCount());
+}
+
+bool LibraryActivity::ensureThumb(LibraryEntry& book, const int coverHeight) {
+  if (!book.thumbPath.empty() && Storage.exists(book.thumbPath.c_str())) return true;
+  if (book.coverAttempted) return false;
+  book.coverAttempted = true;
+
+  Epub epub(book.path, "/.crosspoint");
+  if (!epub.load(false, true)) return false;
+  book.thumbPath = epub.getThumbBmpPath(coverHeight);
+  if (!Storage.exists(book.thumbPath.c_str()) && !epub.generateThumbBmp(coverHeight)) {
+    book.thumbPath.clear();
+    return false;
+  }
+  return Storage.exists(book.thumbPath.c_str());
+}
+
+void LibraryActivity::drawBookCard(LibraryEntry& book, const int x, const int y, const int width, const int height,
+                                   const bool selected) {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const int border = selected ? 3 : 1;
+  const int padding = 7;
+  renderer.drawRoundedRect(x, y, width, height, border, 7, true);
+
+  const int titleHeight = 52;
+  const int coverAreaHeight = std::max(40, height - titleHeight - padding * 2);
+  const int coverHeight = std::max(36, coverAreaHeight - 4);
+  const int coverMaxWidth = std::max(36, width - padding * 2 - 8);
+  bool coverDrawn = false;
+
+  if (ensureThumb(book, coverHeight)) {
+    HalFile file = Storage.open(book.thumbPath.c_str());
+    if (file) {
+      Bitmap bitmap(file);
+      if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+        const int naturalW = std::max(1, bitmap.getWidth());
+        const int naturalH = std::max(1, bitmap.getHeight());
+        int drawW = coverMaxWidth;
+        int drawH = (naturalH * drawW) / naturalW;
+        if (drawH > coverAreaHeight) {
+          drawH = coverAreaHeight;
+          drawW = (naturalW * drawH) / naturalH;
+        }
+        const int coverX = x + (width - drawW) / 2;
+        renderer.drawBitmap(bitmap, coverX, y + padding, drawW, drawH);
+        coverDrawn = true;
+      }
+      file.close();
+    }
+  }
+
+  if (!coverDrawn) {
+    const int fallbackW = std::min(coverMaxWidth, 94);
+    const int fallbackH = std::min(coverAreaHeight, 128);
+    const int fallbackX = x + (width - fallbackW) / 2;
+    const int fallbackY = y + padding;
+    renderer.drawRect(fallbackX, fallbackY, fallbackW, fallbackH, 2, true);
+    UITheme::drawCenteredWrappedText(renderer, Rect{fallbackX + 5, fallbackY + 5, fallbackW - 10, fallbackH - 10},
+                                     SMALL_FONT_ID, book.title.c_str(), 4, true);
+  }
+
+  const int titleY = y + height - titleHeight;
+  UITheme::drawCenteredWrappedText(renderer, Rect{x + metrics.verticalSpacing, titleY, width - metrics.verticalSpacing * 2,
+                                                  titleHeight},
+                                   SMALL_FONT_ID, book.title.c_str(), 2, true,
+                                   EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::CENTER);
 }
 
 void LibraryActivity::onEnter() {
@@ -191,14 +289,7 @@ void LibraryActivity::openSelected() {
     --index;
   }
 
-  for (const auto& book : books) {
-    if (isMagazinePath(book.path)) continue;
-    if (index == 0) {
-      activityManager.goToReader(book.path);
-      return;
-    }
-    --index;
-  }
+  if (auto* book = regularBookAt(index)) activityManager.goToReader(book->path);
 }
 
 void LibraryActivity::goBack() {
@@ -233,12 +324,14 @@ void LibraryActivity::loop() {
     return;
   }
 
-  int touchSel = static_cast<int>(selectorIndex);
-  const auto listTouch = handleListTouch(touchSel, listSize, contentTop, contentHeight, true);
-  if (listTouch != ListTouchResult::None) {
-    selectorIndex = static_cast<size_t>(touchSel);
-    if (listTouch == ListTouchResult::Activated) openSelected();
-    return;
+  if (view != View::Root) {
+    int touchSel = static_cast<int>(selectorIndex);
+    const auto listTouch = handleListTouch(touchSel, listSize, contentTop, contentHeight, true);
+    if (listTouch != ListTouchResult::None) {
+      selectorIndex = static_cast<size_t>(touchSel);
+      if (listTouch == ListTouchResult::Activated) openSelected();
+      return;
+    }
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
@@ -250,12 +343,16 @@ void LibraryActivity::loop() {
 
   const auto swipe = mappedInput.wasSwipe();
   if (swipe == MappedInputManager::SwipeDir::Up) {
-    selectorIndex = ButtonNavigator::nextPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
+    selectorIndex = view == View::Root
+                        ? ButtonNavigator::nextIndex(static_cast<int>(selectorIndex), listSize)
+                        : ButtonNavigator::nextPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
     requestUpdate();
     return;
   }
   if (swipe == MappedInputManager::SwipeDir::Down) {
-    selectorIndex = ButtonNavigator::previousPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
+    selectorIndex = view == View::Root
+                        ? ButtonNavigator::previousIndex(static_cast<int>(selectorIndex), listSize)
+                        : ButtonNavigator::previousPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
     requestUpdate();
     return;
   }
@@ -269,11 +366,15 @@ void LibraryActivity::loop() {
     requestUpdate();
   });
   buttonNavigator.onNextContinuous([this, listSize, pageItems] {
-    selectorIndex = ButtonNavigator::nextPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
+    selectorIndex = view == View::Root
+                        ? ButtonNavigator::nextIndex(static_cast<int>(selectorIndex), listSize)
+                        : ButtonNavigator::nextPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
     requestUpdate();
   });
   buttonNavigator.onPreviousContinuous([this, listSize, pageItems] {
-    selectorIndex = ButtonNavigator::previousPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
+    selectorIndex = view == View::Root
+                        ? ButtonNavigator::previousIndex(static_cast<int>(selectorIndex), listSize)
+                        : ButtonNavigator::previousPageIndex(static_cast<int>(selectorIndex), listSize, pageItems);
     requestUpdate();
   });
 }
@@ -281,8 +382,8 @@ void LibraryActivity::loop() {
 void LibraryActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
+  const int pageWidth = renderer.getScreenWidth();
+  const int pageHeight = renderer.getScreenHeight();
   const auto& metrics = UITheme::getInstance().getMetrics();
 
   const char* heading = "Library";
@@ -320,64 +421,66 @@ void LibraryActivity::render(RenderLock&&) {
   } else {
     const auto& recent = RECENT_BOOKS.getBooks();
     const bool hasContinue = !recent.empty() && !RecentBooksStore::isMissing(recent.front());
-    const int itemCount = currentItemCount();
+    const bool hasMagazines = !magazineSeries.empty();
+    const size_t regularCount = regularBookCount();
 
-    if (itemCount == 0) {
-      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, contentTop + 20, "No EPUB books found");
+    int y = contentTop;
+    int globalOffset = 0;
+
+    if (hasContinue) {
+      constexpr int continueHeight = 64;
+      const bool selected = selectorIndex == 0;
+      if (selected) renderer.drawRoundedRect(metrics.contentSidePadding, y, pageWidth - metrics.contentSidePadding * 2,
+                                             continueHeight, 3, 7, true);
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding + 10, y + 8, "Continue reading", true,
+                        EpdFontFamily::BOLD);
+      const std::string title = recent.front().title.empty() ? fileTitleFromPath(recent.front().path) : recent.front().title;
+      renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding + 10, y + 34, title.c_str());
+      y += continueHeight + metrics.verticalSpacing;
+      ++globalOffset;
+    }
+
+    if (hasMagazines) {
+      constexpr int magazineHeight = 54;
+      const bool selected = selectorIndex == static_cast<size_t>(globalOffset);
+      if (selected) renderer.drawRoundedRect(metrics.contentSidePadding, y, pageWidth - metrics.contentSidePadding * 2,
+                                             magazineHeight, 3, 7, true);
+      size_t issueCount = 0;
+      for (const auto& series : magazineSeries) issueCount += series.issueCount;
+      renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding + 10, y + 7, "Magazines", true,
+                        EpdFontFamily::BOLD);
+      const std::string subtitle = std::to_string(magazineSeries.size()) + " titles - " + std::to_string(issueCount) + " issues";
+      renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding + 10, y + 31, subtitle.c_str());
+      y += magazineHeight + metrics.verticalSpacing;
+      ++globalOffset;
+    }
+
+    if (regularCount == 0) {
+      if (!hasContinue && !hasMagazines)
+        renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, y + 20, "No EPUB books found");
     } else {
-      GUI.drawList(
-          renderer, Rect{0, contentTop, pageWidth, contentHeight}, itemCount, selectorIndex,
-          [this, hasContinue, &recent](int rawIndex) {
-            size_t index = static_cast<size_t>(rawIndex);
-            if (hasContinue) {
-              if (index == 0) return recent.front().title.empty() ? fileTitleFromPath(recent.front().path)
-                                                                  : recent.front().title;
-              --index;
-            }
-            if (!magazineSeries.empty()) {
-              if (index == 0) return std::string("Magazines");
-              --index;
-            }
-            for (const auto& book : books) {
-              if (isMagazinePath(book.path)) continue;
-              if (index == 0) return book.title;
-              --index;
-            }
-            return std::string();
-          },
-          [this, hasContinue, &recent](int rawIndex) {
-            size_t index = static_cast<size_t>(rawIndex);
-            if (hasContinue) {
-              if (index == 0) {
-                const std::string author = recent.front().author;
-                return author.empty() ? std::string("Continue reading") : std::string("Continue reading - ") + author;
-              }
-              --index;
-            }
-            if (!magazineSeries.empty()) {
-              if (index == 0) {
-                size_t issueCount = 0;
-                for (const auto& series : magazineSeries) issueCount += series.issueCount;
-                return std::to_string(magazineSeries.size()) + " titles - " + std::to_string(issueCount) + " issues";
-              }
-              --index;
-            }
-            for (const auto& book : books) {
-              if (isMagazinePath(book.path)) continue;
-              if (index == 0) return book.author.empty() ? book.path : book.author;
-              --index;
-            }
-            return std::string();
-          },
-          [this, hasContinue](int rawIndex) {
-            size_t index = static_cast<size_t>(rawIndex);
-            if (hasContinue) {
-              if (index == 0) return UITheme::getFileIcon("book.epub");
-              --index;
-            }
-            if (!magazineSeries.empty() && index == 0) return UITheme::getFileIcon("magazine.epub");
-            return UITheme::getFileIcon("book.epub");
-          });
+      const size_t selectedRegular = selectorIndex >= static_cast<size_t>(globalOffset)
+                                         ? selectorIndex - static_cast<size_t>(globalOffset)
+                                         : 0;
+      const size_t pageStart = (selectedRegular / GRID_BOOKS_PER_PAGE) * GRID_BOOKS_PER_PAGE;
+      const int gridTop = y;
+      const int gridHeight = pageHeight - gridTop - metrics.buttonHintsHeight - metrics.verticalSpacing;
+      const int gap = 10;
+      const int cellWidth = (pageWidth - metrics.contentSidePadding * 2 - gap) / GRID_COLUMNS;
+      const int cellHeight = std::max(140, (gridHeight - gap) / GRID_ROWS);
+
+      for (int cell = 0; cell < GRID_BOOKS_PER_PAGE; ++cell) {
+        const size_t bookIndex = pageStart + static_cast<size_t>(cell);
+        if (bookIndex >= regularCount) break;
+        auto* book = regularBookAt(bookIndex);
+        if (!book) continue;
+        const int col = cell % GRID_COLUMNS;
+        const int row = cell / GRID_COLUMNS;
+        const int x = metrics.contentSidePadding + col * (cellWidth + gap);
+        const int cardY = gridTop + row * (cellHeight + gap);
+        const bool selected = selectorIndex == static_cast<size_t>(globalOffset) + bookIndex;
+        drawBookCard(*book, x, cardY, cellWidth, cellHeight, selected);
+      }
     }
   }
 
