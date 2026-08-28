@@ -39,6 +39,13 @@ constexpr uint64_t MICROSECONDS_PER_SECOND = 1000000ULL;
 constexpr char DIAGNOSTIC_PATH[] = "/.crosspoint/auto_opds_sync.log";
 constexpr size_t DIAGNOSTIC_MAX_BYTES = 32 * 1024;
 
+// Latch the ESP wake metadata during C++ static initialization, before setup()
+// initializes HAL components. Some HAL/IDF initialization paths may touch reset
+// or sleep state, so scheduled-wake classification must use this boot-time
+// snapshot rather than re-reading the registers later in setup().
+const esp_reset_reason_t BOOT_RESET_REASON = esp_reset_reason();
+const esp_sleep_wakeup_cause_t BOOT_WAKE_CAUSE = esp_sleep_get_wakeup_cause();
+
 void rotateDiagnosticIfNeeded() {
   if (!Storage.exists(DIAGNOSTIC_PATH)) return;
   HalFile file;
@@ -308,8 +315,9 @@ void stopWifi() {
 }  // namespace
 
 bool isTimerWake() {
-  return gpio.deviceIsX3() && esp_reset_reason() == ESP_RST_DEEPSLEEP &&
-         esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+  // ESP_SLEEP_WAKEUP_TIMER is already an unambiguous scheduled wake source.
+  // Use the boot-time snapshot so later HAL initialization cannot hide it.
+  return gpio.deviceIsX3() && BOOT_WAKE_CAUSE == ESP_SLEEP_WAKEUP_TIMER;
 }
 
 bool hasEnabledServers() {
@@ -359,8 +367,8 @@ bool armNextWake() {
 
 bool run() {
   if (!gpio.deviceIsX3()) return false;
-  diagnostic("timer wake detected reset_reason=%d wake_cause=%d auto_servers=%u", static_cast<int>(esp_reset_reason()),
-             static_cast<int>(esp_sleep_get_wakeup_cause()),
+  diagnostic("timer wake detected reset_reason=%d wake_cause=%d auto_servers=%u", static_cast<int>(BOOT_RESET_REASON),
+             static_cast<int>(BOOT_WAKE_CAUSE),
              static_cast<unsigned>(std::count_if(OPDS_STORE.getServers().begin(), OPDS_STORE.getServers().end(),
                                                  [](const OpdsServer& server) { return isAutoServer(server); })));
   if (!hasEnabledServers()) {
