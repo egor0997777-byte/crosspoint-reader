@@ -34,6 +34,30 @@ std::string fileTitleFromPath(const std::string& path) {
 bool shouldSkipDirectory(const char* name) {
   return name[0] == '.' || strcmp(name, "System Volume Information") == 0;
 }
+
+int readingProgressPercent(const std::string& path) {
+  Epub epub(path, "/.crosspoint");
+  if (!epub.load(true, true) || epub.getBookSize() == 0) return -1;
+
+  HalFile file;
+  if (!Storage.openFileForRead("LIB", epub.getCachePath() + "/progress.bin", file) || !file) return -1;
+
+  uint8_t data[10] = {};
+  const int dataSize = file.read(data, sizeof(data));
+  file.close();
+  if (dataSize != 4 && dataSize != 6 && dataSize != 10) return -1;
+
+  const int spineIndex = data[0] + (data[1] << 8);
+  const int page = data[2] + (data[3] << 8);
+  const int pageCount = dataSize >= 6 ? data[4] + (data[5] << 8) : 0;
+  float chapterProgress = 0.0f;
+  if (pageCount > 1) {
+    chapterProgress = std::clamp(static_cast<float>(page) / static_cast<float>(pageCount - 1), 0.0f, 1.0f);
+  }
+
+  const float bookProgress = epub.calculateProgress(spineIndex, chapterProgress) * 100.0f;
+  return std::clamp(static_cast<int>(bookProgress + 0.5f), 0, 100);
+}
 }  // namespace
 
 void LibraryActivity::scanLibrary() {
@@ -98,10 +122,12 @@ void LibraryActivity::loadMagazineSeries() {
       MagazineSeriesEntry series;
       series.name = issue.series;
       series.issueCount = 1;
+      series.newCount = issue.isNew ? 1 : 0;
       series.latestTitle = issue.title.empty() ? fileTitleFromPath(issue.path) : issue.title;
       magazineSeries.push_back(std::move(series));
     } else {
       ++it->issueCount;
+      if (issue.isNew) ++it->newCount;
     }
   }
 
@@ -264,7 +290,12 @@ void LibraryActivity::openSelected() {
 
   if (view == View::Issues) {
     if (selectorIndex >= visibleIssues.size()) return;
-    activityManager.goToReader(visibleIssues[selectorIndex].path);
+    const std::string path = visibleIssues[selectorIndex].path;
+    if (MAGAZINE_ISSUES.markRead(path)) {
+      visibleIssues[selectorIndex].isNew = false;
+      loadMagazineSeries();
+    }
+    activityManager.goToReader(path);
     return;
   }
 
@@ -401,8 +432,12 @@ void LibraryActivity::render(RenderLock&&) {
       GUI.drawList(renderer, Rect{0, contentTop, pageWidth, contentHeight}, magazineSeries.size(), selectorIndex,
                    [this](int index) { return magazineSeries[index].name; },
                    [this](int index) {
-                     return std::to_string(magazineSeries[index].issueCount) + " issues - latest: " +
-                            magazineSeries[index].latestTitle;
+                     std::string subtitle = std::to_string(magazineSeries[index].issueCount) + " issues";
+                     if (magazineSeries[index].newCount > 0) {
+                       subtitle += " - " + std::to_string(magazineSeries[index].newCount) + " new";
+                     }
+                     subtitle += " - latest: " + magazineSeries[index].latestTitle;
+                     return subtitle;
                    },
                    [this](int) { return UITheme::getFileIcon("magazine.epub"); });
     }
@@ -412,8 +447,10 @@ void LibraryActivity::render(RenderLock&&) {
     } else {
       GUI.drawList(renderer, Rect{0, contentTop, pageWidth, contentHeight}, visibleIssues.size(), selectorIndex,
                    [this](int index) {
-                     return visibleIssues[index].title.empty() ? fileTitleFromPath(visibleIssues[index].path)
-                                                               : visibleIssues[index].title;
+                     std::string title = visibleIssues[index].title.empty() ? fileTitleFromPath(visibleIssues[index].path)
+                                                                          : visibleIssues[index].title;
+                     if (visibleIssues[index].isNew) title = "NEW - " + title;
+                     return title;
                    },
                    [this](int index) { return visibleIssues[index].author; },
                    [this](int) { return UITheme::getFileIcon("magazine.epub"); });
@@ -435,7 +472,10 @@ void LibraryActivity::render(RenderLock&&) {
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding + 10, y + 8, "Continue reading", true,
                         EpdFontFamily::BOLD);
       const std::string title = recent.front().title.empty() ? fileTitleFromPath(recent.front().path) : recent.front().title;
-      renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding + 10, y + 34, title.c_str());
+      std::string subtitle = title;
+      const int progress = readingProgressPercent(recent.front().path);
+      if (progress >= 0) subtitle += " - " + std::to_string(progress) + "%";
+      renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding + 10, y + 34, subtitle.c_str());
       y += continueHeight + metrics.verticalSpacing;
       ++globalOffset;
     }
@@ -446,10 +486,15 @@ void LibraryActivity::render(RenderLock&&) {
       if (selected) renderer.drawRoundedRect(metrics.contentSidePadding, y, pageWidth - metrics.contentSidePadding * 2,
                                              magazineHeight, 3, 7, true);
       size_t issueCount = 0;
-      for (const auto& series : magazineSeries) issueCount += series.issueCount;
+      size_t newCount = 0;
+      for (const auto& series : magazineSeries) {
+        issueCount += series.issueCount;
+        newCount += series.newCount;
+      }
       renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding + 10, y + 7, "Magazines", true,
                         EpdFontFamily::BOLD);
-      const std::string subtitle = std::to_string(magazineSeries.size()) + " titles - " + std::to_string(issueCount) + " issues";
+      std::string subtitle = std::to_string(magazineSeries.size()) + " titles - " + std::to_string(issueCount) + " issues";
+      if (newCount > 0) subtitle += " - " + std::to_string(newCount) + " new";
       renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding + 10, y + 31, subtitle.c_str());
       y += magazineHeight + metrics.verticalSpacing;
       ++globalOffset;
