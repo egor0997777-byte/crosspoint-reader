@@ -13,6 +13,7 @@ void MagazineIssueStore::toJson(JsonDocument& doc) const {
     obj["path"] = issue.path;
     obj["title"] = issue.title;
     obj["author"] = issue.author;
+    obj["new"] = issue.isNew;
   }
 }
 
@@ -28,6 +29,7 @@ bool MagazineIssueStore::fromJson(JsonVariantConst doc) {
     issue.path = obj["path"] | "";
     issue.title = obj["title"] | "";
     issue.author = obj["author"] | "";
+    issue.isNew = obj["new"] | false;
     if (issue.series.empty() || issue.path.empty()) continue;
     issues.push_back(std::move(issue));
   }
@@ -38,7 +40,7 @@ bool MagazineIssueStore::fromJson(JsonVariantConst doc) {
 
 bool MagazineIssueStore::recordIssue(const std::string& series, const std::string& path, const std::string& title,
                                      const std::string& author) {
-  return recordIssues({MagazineIssue{series, path, title, author}});
+  return recordIssues({MagazineIssue{series, path, title, author, false}});
 }
 
 bool MagazineIssueStore::recordIssues(const std::vector<MagazineIssue>& feedOrder) {
@@ -46,12 +48,23 @@ bool MagazineIssueStore::recordIssues(const std::vector<MagazineIssue>& feedOrde
 
   std::vector<MagazineIssue> incoming;
   incoming.reserve(feedOrder.size());
-  for (const auto& issue : feedOrder) {
-    if (issue.series.empty() || issue.path.empty()) continue;
-    const bool duplicate = std::any_of(incoming.begin(), incoming.end(), [&issue](const MagazineIssue& existing) {
-      return existing.path == issue.path;
+  for (const auto& candidate : feedOrder) {
+    if (candidate.series.empty() || candidate.path.empty()) continue;
+    const bool duplicate = std::any_of(incoming.begin(), incoming.end(), [&candidate](const MagazineIssue& existing) {
+      return existing.path == candidate.path;
     });
-    if (!duplicate) incoming.push_back(issue);
+    if (duplicate) continue;
+
+    MagazineIssue issue = candidate;
+    const auto existing = std::find_if(issues.begin(), issues.end(), [&issue](const MagazineIssue& oldIssue) {
+      return oldIssue.path == issue.path;
+    });
+    if (existing == issues.end()) {
+      issue.isNew = true;
+    } else {
+      issue.isNew = issue.isNew || existing->isNew;
+    }
+    incoming.push_back(std::move(issue));
   }
   if (incoming.empty()) return false;
 
@@ -64,6 +77,13 @@ bool MagazineIssueStore::recordIssues(const std::vector<MagazineIssue>& feedOrde
 
   issues.insert(issues.begin(), incoming.begin(), incoming.end());
   if (issues.size() > MAX_ISSUES) issues.resize(MAX_ISSUES);
+  return saveToFile();
+}
+
+bool MagazineIssueStore::markRead(const std::string& path) {
+  auto it = std::find_if(issues.begin(), issues.end(), [&path](const MagazineIssue& issue) { return issue.path == path; });
+  if (it == issues.end() || !it->isNew) return true;
+  it->isNew = false;
   return saveToFile();
 }
 
