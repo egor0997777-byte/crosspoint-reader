@@ -38,6 +38,8 @@ constexpr unsigned long OTHER_WIFI_TIMEOUT_MS = 6000;
 constexpr uint64_t MICROSECONDS_PER_SECOND = 1000000ULL;
 constexpr char DIAGNOSTIC_PATH[] = "/.crosspoint/auto_opds_sync.log";
 constexpr size_t DIAGNOSTIC_MAX_BYTES = 32 * 1024;
+constexpr uint32_t BOOT_HISTORY_MAGIC_VALUE = 0xA0D5B007;
+constexpr size_t BOOT_HISTORY_CAPACITY = 8;
 
 // Latch the ESP wake metadata during C++ static initialization, before setup()
 // initializes HAL components. Some HAL/IDF initialization paths may touch reset
@@ -45,6 +47,36 @@ constexpr size_t DIAGNOSTIC_MAX_BYTES = 32 * 1024;
 // snapshot rather than re-reading the registers later in setup().
 const esp_reset_reason_t BOOT_RESET_REASON = esp_reset_reason();
 const esp_sleep_wakeup_cause_t BOOT_WAKE_CAUSE = esp_sleep_get_wakeup_cause();
+
+// Keep a tiny wake ledger in RTC memory. ESP32-C3 retains RTC memory across
+// deep sleep, so even if a wake happens before the SD-backed diagnostic log can
+// be opened, the next successful boot/sleep cycle can report that wake cause.
+struct BootSnapshot {
+  uint32_t resetReason;
+  uint32_t wakeCause;
+};
+RTC_NOINIT_ATTR uint32_t bootHistoryMagic;
+RTC_NOINIT_ATTR uint32_t bootHistoryCount;
+RTC_NOINIT_ATTR BootSnapshot bootHistory[BOOT_HISTORY_CAPACITY];
+bool bootSnapshotRecorded = false;
+
+void recordBootSnapshot() {
+  if (bootSnapshotRecorded) return;
+  bootSnapshotRecorded = true;
+
+  if (bootHistoryMagic != BOOT_HISTORY_MAGIC_VALUE || bootHistoryCount > BOOT_HISTORY_CAPACITY) {
+    bootHistoryMagic = BOOT_HISTORY_MAGIC_VALUE;
+    bootHistoryCount = 0;
+  }
+
+  if (bootHistoryCount == BOOT_HISTORY_CAPACITY) {
+    for (size_t index = 1; index < BOOT_HISTORY_CAPACITY; ++index) bootHistory[index - 1] = bootHistory[index];
+    --bootHistoryCount;
+  }
+
+  bootHistory[bootHistoryCount++] =
+      BootSnapshot{static_cast<uint32_t>(BOOT_RESET_REASON), static_cast<uint32_t>(BOOT_WAKE_CAUSE)};
+}
 
 void rotateDiagnosticIfNeeded() {
   if (!Storage.exists(DIAGNOSTIC_PATH)) return;
@@ -93,6 +125,18 @@ void diagnostic(const char* format, ...) {
   file.write(&newline, 1);
   file.flush();
   file.close();
+}
+
+void flushBootHistory() {
+  if (!Storage.ready() || bootHistoryMagic != BOOT_HISTORY_MAGIC_VALUE || bootHistoryCount > BOOT_HISTORY_CAPACITY) {
+    return;
+  }
+
+  for (uint32_t index = 0; index < bootHistoryCount; ++index) {
+    diagnostic("boot history index=%u reset_reason=%u wake_cause=%u", static_cast<unsigned>(index),
+               static_cast<unsigned>(bootHistory[index].resetReason), static_cast<unsigned>(bootHistory[index].wakeCause));
+  }
+  bootHistoryCount = 0;
 }
 
 bool isAutoServer(const OpdsServer& server) { return isAutoServerName(server.name); }
@@ -315,6 +359,7 @@ void stopWifi() {
 }  // namespace
 
 bool isTimerWake() {
+  recordBootSnapshot();
   // ESP_SLEEP_WAKEUP_TIMER is already an unambiguous scheduled wake source.
   // Use the boot-time snapshot so later HAL initialization cannot hide it.
   return gpio.deviceIsX3() && BOOT_WAKE_CAUSE == ESP_SLEEP_WAKEUP_TIMER;
@@ -327,7 +372,9 @@ bool hasEnabledServers() {
 }
 
 bool armNextWake() {
-  if (!gpio.deviceIsX3() || !hasEnabledServers()) return false;
+  if (!gpio.deviceIsX3()) return false;
+  flushBootHistory();
+  if (!hasEnabledServers()) return false;
   if (!halClock.isAvailable()) {
     LOG_ERR("AODS", "Timer not armed: X3 RTC is unavailable");
     diagnostic("timer not armed reason=rtc_unavailable");
@@ -367,6 +414,7 @@ bool armNextWake() {
 
 bool run() {
   if (!gpio.deviceIsX3()) return false;
+  flushBootHistory();
   diagnostic("timer wake detected reset_reason=%d wake_cause=%d auto_servers=%u", static_cast<int>(BOOT_RESET_REASON),
              static_cast<int>(BOOT_WAKE_CAUSE),
              static_cast<unsigned>(std::count_if(OPDS_STORE.getServers().begin(), OPDS_STORE.getServers().end(),
