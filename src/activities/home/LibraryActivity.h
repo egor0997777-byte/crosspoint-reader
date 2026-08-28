@@ -20,6 +20,7 @@ class LibraryActivity final : public Activity {
   struct MagazineSeriesEntry {
     std::string name;
     size_t issueCount = 0;
+    size_t newCount = 0;
     std::string latestTitle;
   };
 
