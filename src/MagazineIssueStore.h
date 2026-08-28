@@ -11,6 +11,7 @@ struct MagazineIssue {
   std::string path;
   std::string title;
   std::string author;
+  bool isNew = false;
 };
 
 class MagazineIssueStore : public PersistableStore<MagazineIssueStore> {
@@ -29,10 +30,10 @@ class MagazineIssueStore : public PersistableStore<MagazineIssueStore> {
 
   bool recordIssue(const std::string& series, const std::string& path, const std::string& title,
                    const std::string& author);
-  // Record one OPDS feed batch while preserving its order. Items in feedOrder
-  // become the newest block at the front; existing copies of those paths are
-  // removed first. This keeps a newest-first OPDS feed newest-first in Library.
+  // Record one OPDS feed batch while preserving its order. Items that were not
+  // previously indexed are marked new; existing unread state is preserved.
   bool recordIssues(const std::vector<MagazineIssue>& feedOrder);
+  bool markRead(const std::string& path);
   bool pruneMissing();
 
   const std::vector<MagazineIssue>& getIssues() const { return issues; }
